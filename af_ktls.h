@@ -53,6 +53,7 @@
  * Supported ciphers
  */
 #define KTLS_CIPHER_AES_GCM_128		51
+#define KTLS_CIPHER_CHACHA20_POLY1305	52
 
 #define KTLS_VERSION_LATEST		0
 #define KTLS_VERSION_1_2		1
@@ -64,6 +65,9 @@
 #define KTLS_AES_GCM_128_KEY_SIZE	((size_t)16)
 #define KTLS_AES_GCM_128_SALT_SIZE	((size_t)4)
 
+#define KTLS_CHACHA20_POLY1305_IV_SIZE	((size_t)12)
+#define KTLS_CHACHA20_POLY1305_KEY_SIZE	((size_t)16)
+#define KTLS_CHACHA20_POLY1305_SALT_SIZE((size_t)4)
 /*
  * Maximum data size carried in a TLS/DTLS record
  */

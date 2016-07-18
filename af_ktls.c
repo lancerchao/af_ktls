@@ -1493,6 +1493,10 @@ static int tls_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 			tsk->cipher_type = KTLS_CIPHER_AES_GCM_128;
 			tsk->cipher_crypto = "rfc5288(gcm(aes))";
 			break;
+		case KTLS_CIPHER_CHACHA20_POLY1305:
+			tsk->cipher_type = KTLS_CIPHER_CHACHA20_POLY1305;
+			tsk->cipher_crypto = "rfc7539(chacha20,poly1305)";
+			break;
 		default:
 			return -ENOENT;
 	}
