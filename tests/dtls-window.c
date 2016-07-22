@@ -16,7 +16,7 @@
 #define cpu_to_be64 __cpu_to_be64
 
 struct tls_sock {
-	char iv_recv[32];
+	char read_seqno[32];
 	struct {
 		uint64_t bits;
 		uint64_t start;

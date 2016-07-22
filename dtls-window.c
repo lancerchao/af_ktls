@@ -36,7 +36,7 @@ static int dtls_window(struct tls_sock *tsk, const char * sn)
 	uint64_t seq_num, seq_num_last;
 
 	seq_num_ptr = (uint64_t *) sn;
-	seq_num_last_ptr = (uint64_t *) tsk->iv_recv;
+	seq_num_last_ptr = (uint64_t *) tsk->read_seqno;
 	
 	seq_num = be64_to_cpu(*seq_num_ptr);
 	seq_num_last = be64_to_cpu(*seq_num_last_ptr);
