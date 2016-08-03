@@ -31,6 +31,7 @@
 #include <linux/log2.h>
 
 #include "af_ktls.h"
+#include "strparser.c"
 
 #ifndef CHAR_BIT
 # define CHAR_BIT   8
@@ -183,13 +184,6 @@ struct tls_key {
 	size_t saltlen;
 };
 
-struct tls_rx_msg {
-	int full_len;
-	int accum_len;
-	int offset;
-	int early_eaten;
-};
-
 struct tls_sock {
 	/* struct sock must be the very first member */
 	struct sock sk;
@@ -234,6 +228,7 @@ struct tls_sock {
 	char aad_recv[KTLS_AAD_SPACE_SIZE];
 	char header_recv[MAX(KTLS_TLS_PREPEND_SIZE, KTLS_DTLS_PREPEND_SIZE)];
 
+	struct strparser strp;
 	/*
 	 * Asynchronous work in case of low memory
 	 */
@@ -281,12 +276,6 @@ struct tls_sock {
 	unsigned parallel_count_stat;
 };
 
-
-static inline struct tls_rx_msg *tls_rx_msg(struct sk_buff *skb)
-{
-	return (struct tls_rx_msg *)((void *)skb->cb +
-				     offsetof(struct qdisc_skb_cb, data));
-}
 static inline struct tls_sock *tls_sk(struct sock *sk)
 {
 	return (struct tls_sock *)sk;
@@ -416,15 +405,22 @@ static void tls_err_abort(struct tls_sock *tsk)
 	tsk->saved_sk_data_ready(tsk->socket->sk);
 }
 
+static void tls_abort_cb(struct strparser *strp, int err)
+{
+	struct tls_sock *tsk;
+
+	tsk = strp->sk->sk_user_data;
+	tls_err_abort(tsk);
+}
 static int decrypt_skb(struct tls_sock *tsk, struct sk_buff *skb)
 {
 	int ret, nsg;
 	size_t prepend, overhead;
-	struct tls_rx_msg *rxm;
+	struct strp_rx_msg *rxm;
 
 	prepend = IS_TLS(tsk) ? KTLS_TLS_PREPEND_SIZE : KTLS_DTLS_PREPEND_SIZE;
 	overhead = IS_TLS(tsk) ? KTLS_TLS_OVERHEAD : KTLS_DTLS_OVERHEAD;
-	rxm = tls_rx_msg(skb);
+	rxm = strp_rx_msg(skb);
 
 
 	sg_init_table(tsk->sgin, ARRAY_SIZE(tsk->sgin));
@@ -500,13 +496,13 @@ static inline ssize_t tls_read_size(struct tls_sock *tsk, struct sk_buff *skb)
 	size_t prepend;
 	char first_byte;
 	char *header;
-	struct tls_rx_msg *rxm;
+	struct strp_rx_msg *rxm;
 
 	prepend = IS_TLS(tsk) ? KTLS_TLS_PREPEND_SIZE : KTLS_DTLS_PREPEND_SIZE;
 	header = tsk->header_recv;
 	xprintk("--> %s", __func__);
 
-	rxm = tls_rx_msg(skb);
+	rxm = strp_rx_msg(skb);
 
 	ret = skb_copy_bits(skb, rxm->offset, &first_byte, 1);
 	if (ret < 0)
@@ -563,234 +559,50 @@ read_failure:
 	return ret;
 }
 
-/* Lower socket lock held */
-/* Returns the number of bytes used */
-/* A lot of this code was copy/pasta from KCM code. Consider abstracting this */
-static int tls_tcp_recv(read_descriptor_t *desc, struct sk_buff *orig_skb,
-			unsigned int orig_offset, size_t orig_len)
+static int tls_parse_cb(struct strparser *strp, struct sk_buff *skb)
 {
-	struct tls_sock *tsk = (struct tls_sock *)desc->arg.data;
-	struct sock *sk = (struct sock *)tsk;
-	struct tls_rx_msg *rxm;
-	struct sk_buff *head, *skb;
-	size_t eaten = 0, uneaten;
-	ssize_t extra;
-	int err;
-	bool cloned_orig = false;
+	struct tls_sock *tsk;
 
-	head = tsk->rx_skb_head;
-	if (head) {
-		/* We seem to be in the middle of a message */
+	tsk = strp->sk->sk_user_data;
+	return tls_read_size(tsk, skb);
+}
+static void tls_decrypt_and_queue(struct strparser *strp, struct sk_buff *skb, size_t *eaten)
+{
+	struct tls_sock *tsk;
+	int ret;
 
-		rxm = tls_rx_msg(head);
-
-		if (unlikely(rxm->early_eaten)) {
-			/* Already some number of bytes on the receive sock
-			 * data saved in rx_skb_head, just indicate they
-			 * are consumed.
-			 */
-			eaten = orig_len <= rxm->early_eaten ?
-				orig_len : rxm->early_eaten;
-			rxm->early_eaten -= eaten;
-
-			return eaten;
-		}
-
-		if (unlikely(orig_offset)) {
-			/* Getting data with a non-zero offset when a message is
-			 * in progress is not expected. If it does happen, we
-			 * need to clone and pull since we can't deal with
-			 * offsets in the skbs for a message expect in the head.
-			 */
-			orig_skb = skb_clone(orig_skb, GFP_ATOMIC);
-			if (!orig_skb) {
-				desc->error = -ENOMEM;
-				return 0;
-			}
-			if (!pskb_pull(orig_skb, orig_offset)) {
-				kfree_skb(orig_skb);
-				desc->error = -ENOMEM;
-				return 0;
-			}
-			cloned_orig = true;
-			orig_offset = 0;
-		}
-
-		/*We are appending to head. Unshare the frag list */
-		if (!tsk->rx_skb_nextp) {
-			err = skb_unclone(head, GFP_ATOMIC);
-			if (err) {
-				desc->error = err;
-				return 0;
-			}
-
-			if (unlikely(skb_shinfo(head)->frag_list)) {
-				/* We can't append to an sk_buff that already
-				 * has a frag_list. We create a new head, point
-				 * the frag_list of that to the old head, and
-				 * then are able to use the old head->next for
-				 * appending to the message.
-				 */
-				if (WARN_ON(head->next)) {
-					desc->error = -EINVAL;
-					return 0;
-				}
-
-				skb = alloc_skb(0, GFP_ATOMIC);
-				if (!skb) {
-					desc->error = -ENOMEM;
-					return 0;
-				}
-				skb->len = head->len;
-				skb->data_len = head->len;
-				skb->truesize = head->truesize;
-				*tls_rx_msg(skb) = *tls_rx_msg(head);
-				tsk->rx_skb_nextp = &head->next;
-				skb_shinfo(skb)->frag_list = head;
-				tsk->rx_skb_head = skb;
-				head = skb;
-			} else {
-				tsk->rx_skb_nextp =
-				    &skb_shinfo(head)->frag_list;
-			}
-		}
+	tsk = strp->sk->sk_user_data;
+	ret = decrypt_skb(tsk, skb);
+	if (ret < 0) {
+		/* Decryption failed. Send to userspace */
+		*eaten = 0;
+		strp->cb.abort_parser(strp, ret);
+		return;
 	}
 
-	while (eaten < orig_len) {
-		int ret;
-		/* Always clone since we will consume something */
-		skb = skb_clone(orig_skb, GFP_ATOMIC);
-		if (!skb) {
-			desc->error = -ENOMEM;
-			break;
-		}
-
-		uneaten = orig_len - eaten;
-
-		head = tsk->rx_skb_head;
-		/*head is null */
-		if (!head) {
-			head = skb;
-			tsk->rx_skb_head = head;
-			/* Will set rx_skb_nextp on next packet if needed */
-			tsk->rx_skb_nextp = NULL;
-			rxm = tls_rx_msg(head);
-			memset(rxm, 0, sizeof(*rxm));
-			rxm->offset = orig_offset + eaten;
-		} else {
-			/*head not null */
-
-			rxm = tls_rx_msg(head);
-			*tsk->rx_skb_nextp = skb;
-			tsk->rx_skb_nextp = &skb->next;
-			head->data_len += skb->len;
-			head->len += skb->len;
-			head->truesize += skb->truesize;
-		}
-
-		if (!rxm->full_len) {
-			ssize_t len;
-
-			len = tls_read_size(tsk, head);
-
-			/*Is this a sane packet? */
-			if (!len) {
-				/* Need more header to determine length */
-
-				rxm->accum_len += uneaten;
-				eaten += uneaten;
-				WARN_ON(eaten != orig_len);
-				break;
-			} else if (len < 0) {
-				/* Data does not appear to be a TLS record
-				 * Make userspace handle it
-				 */
-				goto decryption_fail;
-			} else if (len <= (ssize_t)head->len -
-					  skb->len - rxm->offset) {
-				/* Length must be into new skb (and also
-				 * greater than zero)
-				 */
-				goto decryption_fail;
-			}
-
-			rxm->full_len = len;
-		}
-
-		extra = (ssize_t)(rxm->accum_len + uneaten) - rxm->full_len;
-
-		if (extra < 0) {
-			/* Message not complete yet. */
-			if (rxm->full_len - rxm->accum_len >
-			    tcp_inq((struct sock *)tsk)) {
-				/* Don't have the whole messages in the socket
-				 * buffer. Set tsk->rx_need_bytes to wait for
-				 * the rest of the message. Also, set "early
-				 * eaten" since we've already buffered the skb
-				 * but don't consume yet per tcp_read_sock.
-				 * If function returns 0, does not consume
-				 */
-
-				/* Wait. Why doesn't this code path just set
-				 * eaten? Then tcp_read_sock will eat and
-				 * profit!
-				 */
-				if (!rxm->accum_len) {
-					/* Start RX timer for new message */
-					/*kcm_start_rx_timer(tsk); */
-				}
-
-				tsk->rx_need_bytes = rxm->full_len -
-						       rxm->accum_len;
-				rxm->accum_len += uneaten;
-				rxm->early_eaten = uneaten;
-				desc->count = 0; /* Stop reading socket */
-				break;
-			}
-			rxm->accum_len += uneaten;
-			eaten += uneaten;
-			WARN_ON(eaten != orig_len);
-			break;
-		}
-
-		/* Positive extra indicates ore bytes than needed for the
-		 * message
+	ret = sock_queue_rcv_skb((struct sock *)tsk, skb);
+	if (ret < 0) {
+		/*
+		 * skb receive queue is full. Apply backpressure
+		 * on TCP socket
 		 */
-
-		WARN_ON(extra > uneaten);
-
-		ret = decrypt_skb(tsk, head);
-		if (ret < 0)
-			goto decryption_fail;
-
-		/* Hurray, we have a new message! */
-		tsk->rx_skb_head = NULL;
-		eaten += (uneaten - extra);
-
-		sock_queue_rcv_skb(sk, head);
+		*eaten = 0;
+		strp->rx_paused = 1;
 	}
-done:
-	if (cloned_orig)
-		kfree_skb(orig_skb);
-	return eaten;
-decryption_fail:
-	kfree_skb(skb);
-	desc->error = -EBADMSG;
-	tsk->rx_skb_head = NULL;
-	desc->count = 0;
-	goto done;
+
+
 }
 
 static int tls_tcp_read_sock(struct tls_sock *tsk)
 {
 	read_descriptor_t desc;
 
-	desc.arg.data = tsk;
+	desc.arg.data = &tsk->strp;
 	desc.error = 0;
 	desc.count = 1; /* give more than one skb per call */
 
 	/* sk should be locked here, so okay to do tcp_read_sock */
-	tcp_read_sock(tsk->socket->sk, &desc, tls_tcp_recv);
+	tcp_read_sock(tsk->socket->sk, &desc, strp_tcp_recv);
 
 	return desc.error;
 }
@@ -809,6 +621,7 @@ static void do_tls_data_ready(struct tls_sock *tsk)
 	ret = tls_tcp_read_sock(tsk);
 	if (ret == -ENOMEM) /* No memory. Do it later */
 		queue_work(tls_wq, &tsk->recv_work);
+	/*queue_delayed_work(tls_wq, &tsk->recv_work, 0); */
 
 	/* TLS couldn't handle this message. Pass it directly to userspace */
 	else if (ret == -EBADMSG)
@@ -877,9 +690,9 @@ static int dtls_udp_read_sock(struct tls_sock *tsk)
 	skb_queue_walk_safe(&tsk->socket->sk->sk_receive_queue, p, next) {
 
 		ssize_t len;
-		struct tls_rx_msg *rxm;
+		struct strp_rx_msg *rxm;
 
-		rxm = tls_rx_msg(p);
+		rxm = strp_rx_msg(p);
 		memset(rxm, 0, sizeof(*rxm));
 
 		/* For UDP, set the offset such that the headers are ignored.
@@ -1544,11 +1357,11 @@ static int tls_do_decryption(const struct tls_sock *tsk,
 static int tls_post_process(struct tls_sock *tsk, struct sk_buff *skb)
 {
 	size_t prepend, overhead;
-	struct tls_rx_msg *rxm;
+	struct strp_rx_msg *rxm;
 
 	prepend = IS_TLS(tsk) ? KTLS_TLS_PREPEND_SIZE : KTLS_DTLS_PREPEND_SIZE;
 	overhead = IS_TLS(tsk) ? KTLS_TLS_OVERHEAD : KTLS_DTLS_OVERHEAD;
-	rxm = tls_rx_msg(skb);
+	rxm = strp_rx_msg(skb);
 
 	/* The crypto API does the following transformation.
 	 * Before:
@@ -1663,7 +1476,7 @@ static int tls_recvmsg(struct socket *sock,
 	int err = 0;
 	long timeo;
 	struct tls_sock *tsk;
-	struct tls_rx_msg *rxm;
+	struct strp_rx_msg *rxm;
 	int ret = 0;
 	struct sk_buff *skb;
 
@@ -1684,7 +1497,7 @@ static int tls_recvmsg(struct socket *sock,
 		skb = tls_wait_data(tsk, flags, timeo, &err);
 		if (!skb)
 			goto recv_end;
-		rxm = tls_rx_msg(skb);
+		rxm = strp_rx_msg(skb);
 		chunk = min_t(unsigned int, rxm->full_len, len);
 		err = skb_copy_datagram_msg(skb, rxm->offset, msg, chunk);
 		if (err < 0)
@@ -1719,7 +1532,7 @@ static int dtls_recvmsg(struct socket *sock,
 	ssize_t copied = 0;
 	int err;
 	struct tls_sock *tsk;
-	struct tls_rx_msg *rxm;
+	struct strp_rx_msg *rxm;
 	int ret = 0;
 	struct sk_buff *skb;
 
@@ -1737,7 +1550,7 @@ static int dtls_recvmsg(struct socket *sock,
 			flags & MSG_DONTWAIT, &err);
 	if (!skb)
 		goto recv_end;
-	rxm = tls_rx_msg(skb);
+	rxm = strp_rx_msg(skb);
 	err = skb_copy_datagram_msg(skb, rxm->offset, msg, rxm->full_len);
 	if (err < 0)
 		goto recv_end;
@@ -1774,7 +1587,7 @@ static ssize_t tls_splice_read(struct socket *sock,  loff_t *ppos,
 	ssize_t copied = 0;
 	long timeo;
 	struct tls_sock *tsk;
-	struct tls_rx_msg *rxm;
+	struct strp_rx_msg *rxm;
 	int ret = 0;
 	struct sk_buff *skb;
 	int chunk;
@@ -1797,7 +1610,7 @@ static ssize_t tls_splice_read(struct socket *sock,  loff_t *ppos,
 	if (!skb)
 		goto splice_read_end;
 
-	rxm = tls_rx_msg(skb);
+	rxm = strp_rx_msg(skb);
 	chunk = min_t(unsigned int, rxm->full_len, len);
 	copied = skb_splice_bits(skb, sk, rxm->offset, pipe, chunk,
 			flags, tls_sock_splice);
@@ -1931,6 +1744,7 @@ static int tls_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 	int ret;
 	struct tls_sock *tsk;
 	struct sockaddr_ktls *sa_ktls;
+	struct strp_callbacks cb;
 
 	xprintk("--> %s", __func__);
 
@@ -2008,6 +1822,13 @@ static int tls_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 	}
 
 	((struct sock *)tsk)->sk_err = 0;
+
+	cb.rcv_msg = tls_decrypt_and_queue;
+	cb.abort_parser = tls_abort_cb;
+	cb.parse_msg = tls_parse_cb;
+	cb.read_sock_done = NULL;
+
+	strp_init(&tsk->strp, tsk->socket->sk, &cb);
 
 	write_lock_bh(&tsk->socket->sk->sk_callback_lock);
 	tsk->rx_stopped = 0;
