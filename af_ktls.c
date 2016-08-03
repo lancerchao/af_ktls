@@ -305,7 +305,8 @@ static inline void tls_make_aad(struct tls_sock *tsk,
 
 static int tls_post_process(struct tls_sock *tsk, struct sk_buff *skb);
 static void tls_err_abort(struct tls_sock *tsk);
-
+static int dtls_udp_read_sock(struct tls_sock *tsk);
+static void do_dtls_data_ready(struct tls_sock *tsk);
 static void increment_seqno(unsigned char *seq, struct tls_sock *tsk)
 {
 	int i;
@@ -398,8 +399,10 @@ static void tls_update_senpage_ctx(struct tls_sock *tsk, size_t size)
 /*Must be called with socket callback locked */
 static void tls_unattach(struct tls_sock *tsk)
 {
+	write_lock_bh(&tsk->socket->sk->sk_callback_lock);
 	tsk->socket->sk->sk_data_ready = tsk->saved_sk_data_ready;
 	tsk->socket->sk->sk_user_data = NULL;
+	write_unlock_bh(&tsk->socket->sk->sk_callback_lock);
 }
 
 static void tls_err_abort(struct tls_sock *tsk)
@@ -407,11 +410,10 @@ static void tls_err_abort(struct tls_sock *tsk)
 	struct sock *sk;
 
 	sk = (struct sock *)tsk;
-	tsk->rx_stopped = 1;
-	sk->sk_err = -EBADMSG;
+	xchg(&tsk->rx_stopped, 1);
+	xchg(&sk->sk_err, -EBADMSG);
 	sk->sk_error_report(sk);
 	tsk->saved_sk_data_ready(tsk->socket->sk);
-	tls_unattach(tsk);
 }
 
 static int decrypt_skb(struct tls_sock *tsk, struct sk_buff *skb)
@@ -807,7 +809,6 @@ static void do_tls_data_ready(struct tls_sock *tsk)
 	ret = tls_tcp_read_sock(tsk);
 	if (ret == -ENOMEM) /* No memory. Do it later */
 		queue_work(tls_wq, &tsk->recv_work);
-	/*queue_delayed_work(tls_wq, &tsk->recv_work, 0); */
 
 	/* TLS couldn't handle this message. Pass it directly to userspace */
 	else if (ret == -EBADMSG)
@@ -823,17 +824,43 @@ static void tls_data_ready(struct sock *sk)
 	xprintk("--> %s", __func__);
 
 	read_lock_bh(&sk->sk_callback_lock);
-	//TODO: forgot to lock tsk?
 	tsk = (struct tls_sock *)sk->sk_user_data;
-	if (unlikely(!tsk || tsk->rx_stopped))
+	/*
+	 * TLS socket is unattached. by user. Shouldn't
+	 * ever happen, since tls_unattach sets tsk
+	 * atomically with respect sk_callback_lock.
+	 */
+	if (unlikely(!tsk))
 		goto out;
 
+	/* Should not happen, since binding is atomic
+	 * with respect to setting aead
+	 */
 	if (!KTLS_RECV_READY(tsk)) {
 		queue_work(tls_wq, &tsk->recv_work);
 		goto out;
 	}
+	/*
+	 * A previous call to tls_data_ready
+	 * encountered non-TLS message during parsing.
+	 * However, couldn't reset the callback at that
+	 * time, since tls_data_ready acquires the read
+	 * lock, not write lock. Therefore, it atomically
+	 * sets a boolean
+	 * Userspace is responsible for unattaching
+	 * the TLS socket so that callbacks don't
+	 * enter here, but until then, just call the
+	 * original callback.
+	 */
+	if (unlikely(tsk->rx_stopped)) {
+		tsk->saved_sk_data_ready(tsk->socket->sk);
+		goto out;
+	}
 
-	do_tls_data_ready(tsk);
+	if (IS_TLS(tsk))
+		do_tls_data_ready(tsk);
+	else
+		do_dtls_data_ready(tsk);
 
 out:
 	read_unlock_bh(&sk->sk_callback_lock);
@@ -912,31 +939,10 @@ static void do_dtls_data_ready(struct tls_sock *tsk)
 	ret = dtls_udp_read_sock(tsk);
 	if (ret == -ENOMEM) /* No memory. Do it later */
 		queue_work(tls_wq, &tsk->recv_work);
-	/*queue_delayed_work(tls_wq, &tsk->recv_work, 0); */
+
 	/* TLS couldn't handle this message. Pass it directly to userspace */
 	else if (ret == -EBADMSG)
 		tls_err_abort(tsk);
-}
-/* Called with lower socket held */
-static void dtls_data_ready(struct sock *sk)
-{
-	struct tls_sock *tsk;
-	xprintk("--> %s", __func__);
-
-	read_lock_bh(&sk->sk_callback_lock);
-
-	tsk = (struct tls_sock *)sk->sk_user_data;
-	if (unlikely(!tsk || tsk->rx_stopped))
-		goto out;
-
-	if (!KTLS_RECV_READY(tsk)) {
-		queue_work(tls_wq, &tsk->recv_work);
-		goto out;
-	}
-
-	do_dtls_data_ready(tsk);
-out:
-	read_unlock_bh(&sk->sk_callback_lock);
 }
 
 static void do_tls_sock_rx_work(struct tls_sock *tsk)
@@ -952,11 +958,13 @@ static void do_tls_sock_rx_work(struct tls_sock *tsk)
 	if (unlikely(sk->sk_user_data != tsk))
 		goto out;
 
-	if (unlikely(tsk->rx_stopped))
-		goto out;
-
 	if (!KTLS_RECV_READY(tsk)) {
 		queue_work(tls_wq, &tsk->recv_work);
+		goto out;
+	}
+
+	if (unlikely(tsk->rx_stopped)) {
+		tsk->saved_sk_data_ready(tsk->socket->sk);
 		goto out;
 	}
 
@@ -1153,9 +1161,7 @@ static void tls_do_unattach(struct socket *sock)
 	tsk = tls_sk(sock->sk);
 	sk = tsk->socket->sk;
 
-	read_lock_bh(&sk->sk_callback_lock);
-	tls_err_abort(tsk);
-	read_unlock_bh(&sk->sk_callback_lock);
+	tls_unattach(tsk);
 }
 static int tls_setsockopt(struct socket *sock,
 		int level, int optname,
@@ -2006,12 +2012,11 @@ static int tls_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 	write_lock_bh(&tsk->socket->sk->sk_callback_lock);
 	tsk->rx_stopped = 0;
 	tsk->saved_sk_data_ready = tsk->socket->sk->sk_data_ready;
-	if (IS_TLS(tsk))
-		tsk->socket->sk->sk_data_ready = tls_data_ready;
-	else
-		tsk->socket->sk->sk_data_ready = dtls_data_ready;
+	tsk->socket->sk->sk_data_ready = tls_data_ready;
 	tsk->socket->sk->sk_user_data = tsk;
 	write_unlock_bh(&tsk->socket->sk->sk_callback_lock);
+
+	release_sock(sock->sk);
 
 	/* Check if any TLS packets have come in between the time the
 	 * handshake was completed and bin() was called. If there were,
@@ -2019,8 +2024,7 @@ static int tls_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 	 * KTLS. Therefore, pull the packets from TCP and wake up KTLS
 	 * if necessary
 	 */
-	do_tls_sock_rx_work(tsk);
-	release_sock(sock->sk);
+	queue_work(tls_wq, &tsk->recv_work);
 	return 0;
 
 bind_end:
