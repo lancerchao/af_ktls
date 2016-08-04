@@ -1,0 +1,90 @@
+diff --git a/include/net/strparser.h b/include/net/strparser.h
+index 42b964d..74fdae7 100644
+--- a/include/net/strparser.h
++++ b/include/net/strparser.h
+@@ -45,7 +45,12 @@ struct strparser;
+ /* Callbacks are called with lock held for the attached socket */
+ struct strp_callbacks {
+ 	int (*parse_msg)(struct strparser *strp, struct sk_buff *skb);
+-	void (*rcv_msg)(struct strparser *strp, struct sk_buff *skb);
++	/*
++	 * Eaten contains the number of bytes that is about to be consumed
++	 * from the TCP socket.
++	 * Callback may want to change it to keep data on TCP socket.
++	 */
++	void (*rcv_msg)(struct strparser *strp, struct sk_buff *skb, size_t *eaten);
+ 	int (*read_sock_done)(struct strparser *strp, int err);
+ 	void (*abort_parser)(struct strparser *strp, int err);
+ };
+diff --git a/net/strparser/strparser.c b/net/strparser/strparser.c
+index d7aec13..7187fc6 100644
+--- a/net/strparser/strparser.c
++++ b/net/strparser/strparser.c
+@@ -66,7 +66,7 @@ void strp_parser_err(struct strparser *strp, int err, read_descriptor_t *desc)
+ 	desc->error = err;
+ 	kfree_skb(strp->rx_skb_head);
+ 	strp->rx_skb_head = NULL;
+-	strp_abort_rx_strp(strp, err);
++	strp->cb.abort_parser(strp, err);
+ }
+ 
+ /* Lower socket lock held */
+@@ -296,7 +296,7 @@ static int strp_tcp_recv(read_descriptor_t *desc, struct sk_buff *orig_skb,
+ 		STRP_STATS_INCR(strp->stats.rx_msgs);
+ 
+ 		/* Give skb to upper layer */
+-		strp->cb.rcv_msg(strp, head);
++		strp->cb.rcv_msg(strp, head, &eaten);
+ 
+ 		if (unlikely(strp->rx_paused)) {
+ 			/* Upper layer paused strp */
+@@ -311,6 +311,12 @@ static int strp_tcp_recv(read_descriptor_t *desc, struct sk_buff *orig_skb,
+ 
+ 	return eaten;
+ }
++/*
++ * This symbol should be made available to modules using strparser.
++ * Modules may want to use this function without going through
++ * strp_tcp_data_ready.
++ */
++EXPORT_SYMBOL(strp_tcp_recv);
+ 
+ static int default_read_sock_done(struct strparser *strp, int err)
+ {
+@@ -333,6 +339,7 @@ static int strp_tcp_read_sock(struct strparser *strp)
+ 
+ 	return desc.error;
+ }
++EXPORT_SYMBOL(strp_tcp_read_sock);
+ 
+ /* Lower sock lock held */
+ void strp_tcp_data_ready(struct sock *sk)
+@@ -342,6 +349,19 @@ void strp_tcp_data_ready(struct sock *sk)
+ 	read_lock_bh(&sk->sk_callback_lock);
+ 
+ 	strp = (struct strparser *)sk->sk_user_data;
++
++	/*
++	 * This check is needed to synchronize with do_strp_rx_work.
++	 * do_strp_rx_work acquires a process lock (lock_sock) whereas
++	 * the lock held here is bh_lock_sock. The two locks can be
++	 * held by different threads at the same time, but bh_lock_sock
++	 * allows a thread in BH context to safely check if the process
++	 * lock is held. In this case, if the lock is held, queue work.
++	 */
++	if (sock_owned_by_user(sk)) {
++		queue_delayed_work(strp_wq, &strp->rx_delayed_work, 0);
++		goto out;
++	}
+ 	if (unlikely(!strp || strp->rx_stopped))
+ 		goto out;
+ 
+@@ -411,7 +431,7 @@ static void strp_rx_msg_timeout(unsigned long arg)
+ 	/* Message assembly timed out */
+ 	STRP_STATS_INCR(strp->stats.rx_msg_timeouts);
+ 	lock_sock(strp->sk);
+-	strp_abort_rx_strp(strp, ETIMEDOUT);
++	strp->cb.abort_parser(strp, ETIMEDOUT);
+ 	release_sock(strp->sk);
+ }
+ 
